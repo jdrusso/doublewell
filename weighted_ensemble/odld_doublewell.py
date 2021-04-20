@@ -2,11 +2,11 @@ from west.propagators import WESTPropagator
 from west.systems import WESTSystem
 from westpa.binning import RectilinearBinMapper
 
-from numpy import arange, float32, array, empty, zeros, int_
-from numpy.random import normal as random_normal
+from numpy import linspace, float32, array, empty, zeros, int_, any
+from numpy.random import Generator, PCG64
 from numpy import sqrt as np_sqrt
 
-from sympy import symbols, init_printing, lambdify
+from sympy import symbols, lambdify
 from sympy import diff as symdiff
 
 pcoord_len = 21
@@ -22,18 +22,20 @@ class ODLDPropagator(WESTPropagator):
         self.coord_ndim = 1
 
         # Initialize at the surface of this state
-        self.initial_pcoord = array([10.0], dtype=self.coord_dtype)
+        self.initial_pcoord = array([2.1e-8], dtype=self.coord_dtype)
 
-        self.dt = 0.0005
+        self.dt = 3e-12
 
+        self.mass = 1.55e-25  # 100 Daltons
         # Friction coefficient. This is a collision frequency, but is
         #  usually used as the inverse collision frequency
-        self.lambd = 0.01
-
-        self.kT = 1.0
+        self.lambd = 2.494e13  # 24.95 ps^-1
+        self.kT = 4.142e-21  # Corresponds to 300K
 
         self.sigma = np_sqrt(self.kT * 2)
         self.barrier_height = 10 * self.kT
+
+        self.rng = Generator(PCG64())
 
     def force(self):
         # This gives the force from the doublewell potential at a point.
@@ -41,22 +43,23 @@ class ODLDPropagator(WESTPropagator):
 
         x = symbols("x")
 
-        expr = (0.1 * x) ** 10 - (0.7 * x) ** 2
-
-        vmin = min(lambdify(x, expr)(arange(-17, 17, 0.001)))
-        vmax = max(lambdify(x, expr)(arange(-5, 5, 0.001)))
-        vrange = vmax - vmin
+        expr = (5e7 * x) ** 10 - (3.5e8 * x) ** 2
 
         # Rescale the potential to the desired barrier height
+        vmin = min(lambdify(x, expr)(linspace(0, 4e-8, 10000)))
+        vmax = max(lambdify(x, expr)(linspace(-5e-9, 5e-9, 10000)))
+        vrange = vmax - vmin
+
         normalized_expr = expr / vrange
-        expr = normalized_expr * self.barrier_height
+
+        expr = -1 * normalized_expr * self.barrier_height
 
         _varx = symbols("x")
 
         # Derivative of the potential is a force
-        dV = lambdify(_varx, symdiff(expr, _varx), modules=["math"])
+        dVdx = lambdify(_varx, symdiff(expr, _varx), modules=["math"])
 
-        return dV
+        return dVdx
 
     def get_pcoord(self, state):
         """Get the progress coordinate of the given basis or initial state."""
@@ -88,9 +91,12 @@ class ODLDPropagator(WESTPropagator):
             (n_segs, self.coord_len, self.coord_ndim), dtype=self.coord_dtype
         )
 
+        dVdx = self.force()
+
+        _variance = np_sqrt(2 * self.kT * self.dt / (self.mass * self.lambd))
         for istep in range(1, coord_len):
 
-            _etas = random_normal(0, self.sigma, n_segs)
+            _etas = self.rng.normal(0, _variance, n_segs)
 
             old_xs = coords[:, istep - 1, 0]
             old_vs = velocities[:, istep - 1, 0]
@@ -100,11 +106,11 @@ class ODLDPropagator(WESTPropagator):
 
             # Update the velocity according to Langevin dynamics
             # Compute the forces, and multiply by timestep
-            # v = v0 + a dT
             # Not adding to the previous timestep means it's noninertial
-            _noise = _etas
-            correction = np_sqrt(self.lambd / self.dt)
-            new_vs = (-self.force()(new_xs) + correction * _noise) / self.lambd
+            new_vs = (-dVdx(new_xs) + _etas) / (self.lambd * self.mass)
+
+            if any(new_xs > 5e-8):
+                raise Exception("Simulation blowing up -- timestep likely too large!")
 
             coords[:, istep, 0] = new_xs
             velocities[:, istep, 0] = new_vs
@@ -124,7 +130,8 @@ class ODLDSystem(WESTSystem):
         self.pcoord_len = pcoord_len
 
         self.bin_mapper = RectilinearBinMapper(
-            [[-float("inf")] + list(arange(-10.0, 10.0, 1.0)) + [float("inf")]]
+            # [[-float("inf")] + list(linspace(-2e-8, 2e-8, 21)) + [float("inf")]]
+            [[-float("inf")] + list(linspace(-1.99e-8, 2e-8, 20)) + [float("inf")]]
         )
         self.bin_target_counts = empty((self.bin_mapper.nbins,), int_)
         self.bin_target_counts[...] = 10
