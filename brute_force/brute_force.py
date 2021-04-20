@@ -15,17 +15,15 @@ def doublewell_potential(barrier_height, kT):
     x = symbols("x")
     init_printing(use_unicode=True)
 
-    expr = (0.1 * x) ** 10 - (0.7 * x) ** 2
+    expr = (5e7 * x) ** 10 - (3.5e8 * x) ** 2
 
-    vmin = min(lambdify(x, expr)(np.arange(-17, 17, 0.001)))
-    vmax = max(lambdify(x, expr)(np.arange(-5, 5, 0.001)))
+    vmin = min(lambdify(x, expr)(np.linspace(0, 4e-8, 10000)))
+    vmax = max(lambdify(x, expr)(np.linspace(-5e-9, 5e-9, 10000)))
     vrange = vmax - vmin
 
     normalized_expr = expr / vrange
 
-    barrier_height_kT = barrier_height * kT
-
-    expr = normalized_expr * barrier_height_kT
+    expr = normalized_expr * barrier_height
 
     return expr
 
@@ -37,6 +35,7 @@ def doublewell_potential(barrier_height, kT):
 # (The _l is for _local instead of distributed via Ray)
 def generate_trajectory_l(
     start_x,
+    mass,
     sigma,
     lambd,
     kT,
@@ -56,8 +55,9 @@ def generate_trajectory_l(
 
     np.seterr(over="raise", invalid="raise")
 
+    variance = np.sqrt(2 * kT * dt / (mass * lambd))
     print(
-        f"max: {max_t:.2e} | dt: {dt:.2e} | sigma: {sigma:.2e} | Barrier: {_barrier_height} kT | basins: {BASINS} "
+        f"max: {max_t:.2e} | dt: {dt:.2e} | variance: {variance:.2e} | Barrier: {_barrier_height} ({_barrier_height/kT} kT) | basins: {BASINS} "
     )
 
     # How many random etas to generate at once
@@ -77,10 +77,8 @@ def generate_trajectory_l(
     # So, compute them in chunks instead. 1000 is a pretty reasonable size,
     #     but this could be tuned depending on general trajectory lengths
     rg = Generator(PCG64())
-    _etas = rg.normal(0, sigma, ETA_CHUNK)
+    _etas = rg.normal(0, variance, ETA_CHUNK)
     used_eta = 0
-
-    correction = np.sqrt(lambd / dt)
 
     previous_x = None
     current_x = None
@@ -106,7 +104,7 @@ def generate_trajectory_l(
         # Not adding to the previous timestep means it's noninertial
         try:
             _noise = _etas[i % ETA_CHUNK]
-            _v = (-dVdx(current_x) + correction * _noise) / lambd
+            _v = (-dVdx(current_x) + _noise) / (lambd * mass)
         except FloatingPointError as e:
             print("Errored out")
             print(
@@ -149,7 +147,7 @@ def generate_start_positions(n_starts, barrier_height, kT):
     _varx = symbols("x")
     V = lambdify(_varx, potential, modules=["math"])
 
-    _range = np.arange(-12, 12, 0.01)
+    _range = np.arange(-12, 12, 0.01) * 1e-9
     pdf = np.exp(-V(_range) / kT)
     cdf = np.cumsum(pdf)
     cdf /= max(cdf)
@@ -173,7 +171,9 @@ def find_bin(x_pos, bins):
 
 
 # Returns lists of the AB and BA MFPTs
-def compute_mfpt(trajectories, statesA, statesB, lags=[1, 10], stride=1):
+def compute_mfpt(trajectories, statesA, statesB, stride=1):
+
+    lags = [1]
 
     trajectory_to_analyze = trajectories
 
@@ -252,34 +252,39 @@ def compute_mfpt(trajectories, statesA, statesB, lags=[1, 10], stride=1):
 if __name__ == "__main__":
 
     # Define some physical simulation parameters
-    kT = 1.0
-    lambd = 0.01
+    mass = 1.55e-25  # 100 Daltons
+    kT = 4.142e-21  # Corresponds to 300K
+    lambd = 2.494e13  # 24.95 ps^-1
     sigma = np.sqrt(kT * 2)
-    barrier_height = 5
+    barrier_height = 10*kT
 
     # Generate a set of start points corresponding to the distribution
-    n_starts = 4
+    n_starts = 10
     start_positions = generate_start_positions(
         n_starts=n_starts, barrier_height=barrier_height, kT=kT
     )
 
     # Define simulation length
-    _dt = 0.0005
-    max_time = 1000
+    _dt = 3e-12
+    max_time = _dt*10000000000
+    subsample = 1000
+    # max_time = _dt*1e7
+    # subsample = 1
 
-    # This makes 130 bins, 2 from -16 to -inf and 16 to inf, and 128 of uniform width from
     n_fine_bins = 20
-    bin_spacing = 32 / (n_fine_bins - 2)
+    bin_spacing = 4e-8 / (n_fine_bins - 2)
+
+    boundary = 2e-8
     bin_coords = np.concatenate(
         [
-            [[-np.inf, -16.0]],
+            [[-np.inf, -boundary]],
             list(
                 zip(
-                    np.linspace(-16, 16 - bin_spacing, (n_fine_bins - 2)),
-                    np.linspace(-16 + bin_spacing, 16, (n_fine_bins - 2)),
+                    np.linspace(-boundary, boundary - bin_spacing, (n_fine_bins - 2)),
+                    np.linspace(-boundary + bin_spacing, boundary, (n_fine_bins - 2)),
                 )
             ),
-            [[16.0, np.inf]],
+            [[boundary, np.inf]],
         ]
     )
 
@@ -288,6 +293,8 @@ if __name__ == "__main__":
     # If Ray fails, or you don't want to use it, just call generate_trajectory_l directly
     #    instead of generate_trajectory.remote, and remove the surrounding Ray code.
     ray.init()
+    # For running ray with a cluster (surprisingly easy, try it!)
+    # ray.init(address='auto', _redis_password='set some password here', dashboard_host='127.0.0.1')
 
     # The basins are set to infinity here, because we don't want to run with absorbing boundary conditions.
     continuous_trajectories = ray.get(
@@ -295,12 +302,13 @@ if __name__ == "__main__":
             generate_trajectory.remote(
                 _startx,
                 max_t=max_time,
+                mass=mass,
                 sigma=sigma,
                 lambd=lambd,
                 kT=kT,
                 dt=_dt,
                 _barrier_height=barrier_height,
-                subsample_result=1,
+                subsample_result=subsample,
                 BASINS=[[-np.inf, -np.inf], [np.inf, np.inf]],
             )
             for _startx in start_positions
@@ -308,35 +316,41 @@ if __name__ == "__main__":
     )
 
     # Discretize the continuous trajectories according to bin definitions
-    discretized_trajectories = np.ndarray(shape=(n_starts, int(max_time / _dt)))
+    discretized_trajectories = np.ndarray(shape=(n_starts, int(max_time / _dt) // subsample))
     discretized_trajectories[:] = [
         np.array([find_bin(_x, bin_coords) for _x in trajectory])
         for trajectory in continuous_trajectories
     ]
 
-    lags = [1, 100]
+    lags = [1]
     mfpts = compute_mfpt(
         discretized_trajectories,
         statesA=[0],
         statesB=[n_fine_bins - 1],
-        lags=lags,
         stride=1,
     )
 
+    print(mfpts)
     for i, lag in enumerate(lags):
         print(f"Lag {lag}: ")
 
         AB_means = []
         BA_means = []
         for trajectory in range(n_starts):
-            traj_AB_mean = np.mean(mfpts[0][i][trajectory])
-            traj_BA_mean = np.mean(mfpts[1][i][trajectory])
+            print(f"Trajectory {trajectory}")
+            traj_AB_mean = np.nanmean(mfpts[0][i][trajectory])
+            traj_BA_mean = np.nanmean(mfpts[1][i][trajectory])
+
+            print(traj_AB_mean)
+            print(traj_BA_mean)
 
             AB_means.append(traj_AB_mean)
             BA_means.append(traj_BA_mean)
 
-        print(f"\t AB MFPT: {np.mean(AB_means):.2e} steps")
-        print(f"\t BA MFPT: {np.mean(BA_means):.2e} steps")
+        print(AB_means)
+        print(BA_means)
+        print(f"\t AB MFPT: {np.nanmean(AB_means):.2e} steps ")
+        print(f"\t BA MFPT: {np.nanmean(BA_means):.2e} steps ")
 
     print("Saving generated trajectories...")
     np.savez(
